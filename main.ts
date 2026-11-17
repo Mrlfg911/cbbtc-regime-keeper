@@ -111,6 +111,4 @@ function onBatch(state: BarsState, batch: { bars: Bar[] }): BuyInput[] | SellInp
   return [];
 }
 
-const BPS_NUM = 10_000;
-
 runBars({ onBatch });
