@@ -22,19 +22,20 @@ const ENTRY_FRACTION = 0.97;
 /** Bars in the mean the entry, the breakdown and the re-entry read. */
 const MEAN_BARS = 240;
 /** How far under the mean, in bps, a close must sit to count as a break. */
-const BREAK_MARGIN_BPS = 15;
+const BREAK_MARGIN_BPS = 120;
 /** The trailing stop, in bps under the highest close since entry. */
 const TRAIL_BPS = 800;
 /** Refuse a fill further than this from the close the order was decided on. */
 const MAX_SLIPPAGE_BPS = 150;
 /** Consecutive closes under the mean that make an exit. */
-const BREAK_BARS = 2;
+const BREAK_BARS = 8;
 
 const BPS = 10_000;
 const closes: number[] = [];
 let meanSum = 0;
 let heldHigh: number | null = null;
 let breakRun = 0;
+let cooldown = 0;
 
 function meanOf(): number | null {
   if (closes.length < MEAN_BARS) return null;
@@ -56,6 +57,7 @@ function onBatch(state: BarsState, batch: { bars: Bar[] }): BuyInput[] | SellInp
   const holding = state.positions.get(SYMBOL);
   const held = holding !== undefined && holding.qty > 0n;
   if (!held) heldHigh = null;
+  if (cooldown > 0) cooldown -= 1;
 
   const mean = meanOf();
 
@@ -66,12 +68,14 @@ function onBatch(state: BarsState, batch: { bars: Bar[] }): BuyInput[] | SellInp
     else breakRun = 0;
     if (drawdownBps > TRAIL_BPS || breakRun >= BREAK_BARS) {
       breakRun = 0;
+      cooldown = 180;
       return [{ side: 'sell', symbol: SYMBOL, qty: holding!.qty.toString(), max_slippage_bps: MAX_SLIPPAGE_BPS }];
     }
     return [];
   }
 
   breakRun = 0;
+  if (cooldown > 0) return [];
   const policyOk = mean === null || close >= mean;
   if (!policyOk) return [];
 
