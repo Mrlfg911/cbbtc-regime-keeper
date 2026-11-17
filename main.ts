@@ -1,114 +1,87 @@
-// cbBTC regime follower: holds cbBTC while the trend is up, sits in cash while it is not,
-// and steps aside on a volatility-scaled trailing stop. One asset, long only, no leverage.
+// cbBTC exposure keeper: take the position early, keep it while the market is not breaking
+// down, and step aside on a wide volatility-scaled trailing stop so a crash is not ridden to
+// the bottom. One asset, long only, no leverage, at most one order per reply.
 //
-// Rules, all read from the only bar this reply answers and the closes before it:
-//   - fast and slow EMAs of the close, 45 and 240 bars, seeded on their first span.
-//   - entry (fills at the next open): fast above slow by ENTRY_MARGIN_BPS, and the close above
-//     the slow EMA, and enough history for both.
-//   - exit, the whole position, on any of: fast below slow by EXIT_MARGIN_BPS (a regime flip,
-//     with hysteresis so a flat market does not churn), the close past a trailing stop of
-//     TRAIL_BPS under the highest close since entry, or ATR(60) over the close above the entry
-//     ATR by SPIKE_MULT, which is a volatility break the stop would otherwise ride down.
-//   - a re-entry waits COOLDOWN_BARS after an exit.
-//   - the reply carries at most one order. Slippage is capped at MAX_SLIPPAGE_BPS.
+// Rules, all read from the bars and the account this harness sends:
+//   - entry (fills at the next open): on the first bar where the close is at or above its own
+//     240-bar mean (or on the very first tradeable bar, when there is no history yet), spend
+//     ENTRY_FRACTION of the cash. Only one entry at a time.
+//   - exit, the whole position: a trailing stop of TRAIL_BPS under the highest close since entry,
+//     or two consecutive closes under the 240-bar mean by BREAK_MARGIN_BPS.
+//   - re-entry after an exit: on the first close back above the 240-bar mean, in cash again.
+//   - slippage is capped at MAX_SLIPPAGE_BPS so a liquidity gap refuses the fill instead of
+//     taking it at any price; a refused order is simply sent again on the next bar.
 //
 // Deterministic: float64 arithmetic on + - * / only, no clock, no random, no environment.
 
-import { BPS, runBars, type BarsState, type Bar, type BuyInput, type SellInput } from './vendor/makefun-bars.ts';
+import { runBars, type BarsState, type Bar, type BuyInput, type SellInput } from './vendor/makefun-bars.ts';
 
-const FAST = 45;
-const SLOW = 240;
-const ATR_SPAN = 60;
-const ENTRY_MARGIN_BPS = 12;
-const EXIT_MARGIN_BPS = 10;
-const TRAIL_BPS = 320;
-const SPIKE_MULT = 2.4;
-const COOLDOWN_BARS = 45;
-const MAX_SLIPPAGE_BPS = 120;
-const BPS_NUM = 10_000;
+const SYMBOL = 'CBBTC';
+/** Share of the cash spent on an entry, the fee and the price impact left inside it. */
+const ENTRY_FRACTION = 0.97;
+/** Bars in the mean the entry, the breakdown and the re-entry read. */
+const MEAN_BARS = 240;
+/** How far under the mean, in bps, a close must sit to count as a break. */
+const BREAK_MARGIN_BPS = 15;
+/** The trailing stop, in bps under the highest close since entry. */
+const TRAIL_BPS = 800;
+/** Refuse a fill further than this from the close the order was decided on. */
+const MAX_SLIPPAGE_BPS = 150;
+/** Consecutive closes under the mean that make an exit. */
+const BREAK_BARS = 2;
 
-interface Ema { span: number; count: number; value: number | null }
-function newEma(span: number): Ema { return { span, count: 0, value: null }; }
-function pushEma(e: Ema, x: number): void {
-  if (e.value === null) {
-    e.count += 1;
-    if (e.count >= e.span) e.value = x; // seeded on the span-th close
-    return;
-  }
-  const k = 2 / (e.span + 1);
-  e.value = e.value + k * (x - e.value);
-}
-
-const fast = newEma(FAST);
-const slow = newEma(SLOW);
-
-let prevClose: number | null = null;
-/** Rolling sum of |close - previous close|, the ATR proxy in price units. */
-const ranges: number[] = [];
-let rangeSum = 0;
-let atrAtEntry: number | null = null;
+const BPS = 10_000;
+const closes: number[] = [];
+let meanSum = 0;
 let heldHigh: number | null = null;
-let cooldown = 0;
-let lastSide: 'flat' | 'long' = 'flat';
+let breakRun = 0;
 
-function atr(): number | null {
-  if (ranges.length < ATR_SPAN) return null;
-  return rangeSum / ranges.length;
+function meanOf(): number | null {
+  if (closes.length < MEAN_BARS) return null;
+  return meanSum / closes.length;
 }
 
 function onBatch(state: BarsState, batch: { bars: Bar[] }): BuyInput[] | SellInput[] {
-  const bar = batch.bars.find((b) => b.symbol === 'CBBTC');
+  const bar = batch.bars.find((b) => b.symbol === SYMBOL);
   if (!bar) return [];
-  const close = Number(BigInt(bar.c)) / 1e5; // price_scale 5: USDC per unit
+  if (state.warmingUp) return [];
 
-  if (prevClose !== null) {
-    const r = Math.abs(close - prevClose);
-    ranges.push(r);
-    rangeSum += r;
-    if (ranges.length > ATR_SPAN) rangeSum -= ranges.shift() as number;
-  }
-  prevClose = close;
+  // Price at price_scale 5: USDC per unit, kept as a float only for the indicators.
+  const close = Number(BigInt(bar.c));
 
-  pushEma(fast, close);
-  pushEma(slow, close);
+  closes.push(close);
+  meanSum += close;
+  if (closes.length > MEAN_BARS) meanSum -= closes.shift() as number;
 
-  const holding = state.positions.get('CBBTC');
+  const holding = state.positions.get(SYMBOL);
   const held = holding !== undefined && holding.qty > 0n;
-  if (!held) { heldHigh = null; atrAtEntry = null; }
-  if (cooldown > 0) cooldown -= 1;
+  if (!held) heldHigh = null;
 
-  const f = fast.value;
-  const s = slow.value;
-  if (f === null || s === null) return [];
-
-  const gapBps = ((f - s) / s) * BPS_NUM;
-  const a = atr();
+  const mean = meanOf();
 
   if (held) {
-    if (heldHigh === null) heldHigh = close;
-    if (close > heldHigh) heldHigh = close;
-    const trailBps = heldHigh > 0 ? ((heldHigh - close) / heldHigh) * BPS_NUM : 0;
-    const spike = a !== null && atrAtEntry !== null && atrAtEntry > 0 && a > atrAtEntry * SPIKE_MULT;
-    if (gapBps < -EXIT_MARGIN_BPS || trailBps > TRAIL_BPS || spike) {
-      cooldown = COOLDOWN_BARS;
-      lastSide = 'flat';
-      return [{ side: 'sell', symbol: 'CBBTC', qty: holding!.qty.toString(), max_slippage_bps: MAX_SLIPPAGE_BPS }];
+    if (heldHigh === null || close > heldHigh) heldHigh = close;
+    const drawdownBps = heldHigh > 0 ? ((heldHigh - close) / heldHigh) * BPS : 0;
+    if (mean !== null && close < mean * (1 - BREAK_MARGIN_BPS / BPS)) breakRun += 1;
+    else breakRun = 0;
+    if (drawdownBps > TRAIL_BPS || breakRun >= BREAK_BARS) {
+      breakRun = 0;
+      return [{ side: 'sell', symbol: SYMBOL, qty: holding!.qty.toString(), max_slippage_bps: MAX_SLIPPAGE_BPS }];
     }
     return [];
   }
 
-  if (cooldown === 0 && gapBps > ENTRY_MARGIN_BPS && close > s) {
-    const cash = state.cash;
-    const minNotional = BigInt(state.hello.fees.min_notional_quote_units);
-    if (cash / 50n < minNotional) return [];
-    const spend = (cash * 95n) / 100n; // keep 5% back for the fee and the impact
-    if (spend < minNotional) return [];
-    heldHigh = close;
-    atrAtEntry = a;
-    lastSide = 'long';
-    return [{ side: 'buy', symbol: 'CBBTC', notional_quote_units: spend.toString(), max_slippage_bps: MAX_SLIPPAGE_BPS }];
-  }
-  return [];
+  breakRun = 0;
+  const policyOk = mean === null || close >= mean;
+  if (!policyOk) return [];
+
+  const minNotional = BigInt(state.hello.fees.min_notional_quote_units);
+  const cash = state.cash;
+  const spend = BigInt(Math.floor(Number(cash) * ENTRY_FRACTION));
+  if (spend < minNotional) return [];
+
+  heldHigh = close;
+  return [{ side: 'buy', symbol: SYMBOL, notional_quote_units: spend.toString(), max_slippage_bps: MAX_SLIPPAGE_BPS }];
 }
 
 runBars({ onBatch });
