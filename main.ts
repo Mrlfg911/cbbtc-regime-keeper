@@ -72,8 +72,8 @@ function onBatch(state: BarsState, batch: { bars: Bar[] }): BuyInput[] | SellInp
   pushEma(fast, close);
   pushEma(slow, close);
 
-  const holding = state.positions.find((p) => p.symbol === 'CBBTC');
-  const held = holding !== undefined && BigInt(holding.qty) > 0n;
+  const holding = state.positions.get('CBBTC');
+  const held = holding !== undefined && holding.qty > 0n;
   if (!held) { heldHigh = null; atrAtEntry = null; }
   if (cooldown > 0) cooldown -= 1;
 
@@ -92,13 +92,13 @@ function onBatch(state: BarsState, batch: { bars: Bar[] }): BuyInput[] | SellInp
     if (gapBps < -EXIT_MARGIN_BPS || trailBps > TRAIL_BPS || spike) {
       cooldown = COOLDOWN_BARS;
       lastSide = 'flat';
-      return [{ side: 'sell', symbol: 'CBBTC', qty: holding!.qty, max_slippage_bps: MAX_SLIPPAGE_BPS }];
+      return [{ side: 'sell', symbol: 'CBBTC', qty: holding!.qty.toString(), max_slippage_bps: MAX_SLIPPAGE_BPS }];
     }
     return [];
   }
 
   if (cooldown === 0 && gapBps > ENTRY_MARGIN_BPS && close > s) {
-    const cash = BigInt(state.account.cash_quote_units);
+    const cash = state.cash;
     const minNotional = BigInt(state.hello.fees.min_notional_quote_units);
     if (cash / 50n < minNotional) return [];
     const spend = (cash * 95n) / 100n; // keep 5% back for the fee and the impact
@@ -106,7 +106,7 @@ function onBatch(state: BarsState, batch: { bars: Bar[] }): BuyInput[] | SellInp
     heldHigh = close;
     atrAtEntry = a;
     lastSide = 'long';
-    return [{ side: 'buy', symbol: 'CBBTC', notional_quote_units: spend, max_slippage_bps: MAX_SLIPPAGE_BPS }];
+    return [{ side: 'buy', symbol: 'CBBTC', notional_quote_units: spend.toString(), max_slippage_bps: MAX_SLIPPAGE_BPS }];
   }
   return [];
 }
